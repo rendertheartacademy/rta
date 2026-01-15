@@ -241,10 +241,7 @@ const ComparisonViewer: React.FC<ComparisonViewerProps> = ({
         onLostPointerCapture={handlePointerCancel}
         onContextMenu={(e) => e.preventDefault()}
       >
-        {/* Zoom Indicator */}
-        <div className="absolute top-4 right-4 z-30 pointer-events-none bg-black/50 text-white text-[10px] px-2 py-1 rounded backdrop-blur">
-             {Math.round(transform.scale * 100)}%
-        </div>
+        {/* REMOVED: Zoom Indicator per user request */}
 
         {/* 1. SLIDE MODE */}
         {mode === 'SLIDE' && (
@@ -272,8 +269,8 @@ const ComparisonViewer: React.FC<ComparisonViewerProps> = ({
                     setIsSliding(false); 
                 }}
             >
-                {/* Visual Line - Minimalist */}
-                <div className="absolute top-0 bottom-0 w-[1px] bg-white/30 backdrop-blur-sm group-hover:bg-[#c7023a] transition-colors"></div>
+                {/* Visual Line - Minimalist (Made even more subtle) */}
+                <div className="absolute top-0 bottom-0 w-[1px] bg-white/10 backdrop-blur-sm group-hover:bg-[#c7023a] transition-colors"></div>
                 
                 {/* Minimalist Circle Handle */}
                 <div className="w-4 h-4 rounded-full bg-white/20 backdrop-blur-md border border-white/40 shadow-sm transform transition-all group-hover:scale-125 group-hover:bg-[#c7023a] group-hover:border-[#c7023a]"></div>
