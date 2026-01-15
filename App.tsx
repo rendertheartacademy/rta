@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { 
   LogOut, 
   Upload, 
@@ -20,7 +20,10 @@ import {
   Camera,
   Layers,
   Sparkles,
-  ChevronLeft
+  ChevronLeft,
+  Trash2,
+  MoreVertical,
+  Pencil
 } from 'lucide-react';
 import ComparisonViewer from './components/ComparisonViewer';
 import { Assignment, AssignmentStatus, AssignmentCategory, Feedback, User } from './types';
@@ -59,6 +62,14 @@ const StatusBadge = ({ status }: { status: AssignmentStatus }) => {
   return <span className={`px-2 py-0.5 rounded text-[9px] font-bold tracking-wider border ${styles[status]}`}>{status}</span>;
 };
 
+// --- TYPES ---
+interface StagingItem {
+  id: string; // Random ID for keying
+  type: 'EXISTING' | 'NEW';
+  url: string; // Blob URL or Remote URL
+  file?: File; // Only for NEW items
+}
+
 // --- CURRICULUM DEFINITIONS ---
 const CURRICULUM = {
     MASTER_CLASS: ['BOX_MODELING', 'SCENE_SETUP'] as AssignmentCategory[],
@@ -86,6 +97,7 @@ function App() {
   // --- Teacher State ---
   const [teacherTab, setTeacherTab] = useState<'MASTER' | 'VIZ'>('MASTER');
   const [teacherSelectedStudentId, setTeacherSelectedStudentId] = useState<string | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number, y: number, assignmentId: string, category: AssignmentCategory, studentId: string } | null>(null);
 
   // --- Student View State ---
   const [studentProjectView, setStudentProjectView] = useState<'INTERIOR' | 'EXTERIOR'>('INTERIOR');
@@ -99,11 +111,20 @@ function App() {
   const [selectedProjectForSubmit, setSelectedProjectForSubmit] = useState<'INTERIOR' | 'EXTERIOR' | null>(null);
   const [detectedStep, setDetectedStep] = useState<AssignmentCategory | null>(null);
   
-  // CHANGED: Support multiple uploads
-  const [uploadRenders, setUploadRenders] = useState<string[]>([]);
+  // STORAGE OPTIMIZATION: Use Unified Staging Items for Hydration & Edit
+  const [stagingItems, setStagingItems] = useState<StagingItem[]>([]);
+  const [previewIndex, setPreviewIndex] = useState(0); // For Carousel
+  const [previewMenuOpen, setPreviewMenuOpen] = useState(false); // For Pencil Menu
   
+  // REPLACE LOGIC FIX: State-Based Index Tracking
+  const [replacingIndex, setReplacingIndex] = useState<number | null>(null);
+  const replaceInputRef = useRef<HTMLInputElement>(null);
+
   const [submissionMessage, setSubmissionMessage] = useState('');
   const [submitStep, setSubmitStep] = useState<'SELECT_PROJECT' | 'UPLOAD_RENDER' | 'VERIFY'>('SELECT_PROJECT');
+  
+  // EDIT MODE STATE
+  const [isEditingAssignmentId, setIsEditingAssignmentId] = useState<string | null>(null);
 
   // --- Profile/Settings State ---
   const [newInteriorRef, setNewInteriorRef] = useState<string | null>(null);
@@ -123,14 +144,13 @@ function App() {
         a.category === viewingGroupParams.category && 
         a.referenceImage === viewingGroupParams.referenceImage
     ).sort((a,b) => {
-        // Stable sort: Submission Date -> ID
+        // REVERSE PAGINATION: Newest First (Leftmost)
         const dA = new Date(a.submissionDate).getTime();
         const dB = new Date(b.submissionDate).getTime();
-        return dA === dB ? a.id.localeCompare(b.id) : dA - dB;
+        return dB - dA; 
     });
   }, [assignments, viewingGroupParams]);
 
-  // Derived state for resubmission
   const isResubmission = currentUser && detectedStep && selectedProjectForSubmit ? assignments.some(a => 
     a.studentId === currentUser.id && 
     a.category === detectedStep && 
@@ -168,13 +188,14 @@ function App() {
       
       if (newIdx >= 0 && newIdx < filteredCommunityGroups.length) {
           const newGroup = filteredCommunityGroups[newIdx];
-          const latest = newGroup[newGroup.length - 1];
+          // Default to latest version (index 0) of the new group
+          const latest = newGroup[0]; 
           setViewingGroupParams({
               studentId: latest.studentId,
               category: latest.category,
               referenceImage: latest.referenceImage
           });
-          setViewingVersionIndex(newGroup.length - 1);
+          setViewingVersionIndex(0); // Always start at latest
           if(currentUser?.role === 'TEACHER') setSelectedAssignmentId(null);
       }
   }, [currentGroupIdx, filteredCommunityGroups, currentUser]);
@@ -193,15 +214,23 @@ function App() {
 
   // --- EFFECTS ---
   
-  // KEYBOARD NAVIGATION
+  // DEEP ARROW KEY NAVIGATION
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-        if (!viewingGroupParams) return; // Only if modal is open
+        if (!viewingGroupParams || !studentViewAssignmentGroup) return; 
 
         if (e.key === 'ArrowLeft') {
-            navigateGroup('prev');
+            if (viewingVersionIndex > 0) {
+                 setViewingVersionIndex(prev => prev - 1);
+            } else {
+                 navigateGroup('prev');
+            }
         } else if (e.key === 'ArrowRight') {
-            navigateGroup('next');
+             if (viewingVersionIndex < studentViewAssignmentGroup.length - 1) {
+                 setViewingVersionIndex(prev => prev + 1);
+             } else {
+                 navigateGroup('next');
+             }
         } else if (e.key === 'Escape') {
              setViewingGroupParams(null);
              if(currentUser?.role === 'TEACHER') setSelectedAssignmentId(null);
@@ -210,10 +239,8 @@ function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [viewingGroupParams, navigateGroup, currentUser]);
+  }, [viewingGroupParams, viewingVersionIndex, studentViewAssignmentGroup, navigateGroup, currentUser]);
 
-  // FIX: Black Screen Issue & Default Tab
-  // Automatically switch to SUBMIT tab if student logs in
   useEffect(() => {
     if (currentUser?.role === 'STUDENT') {
        if (activeTab === 'DASHBOARD') {
@@ -227,22 +254,19 @@ function App() {
     }
   }, [currentUser]);
 
-  // UPDATED: Onboarding & Auto-Unlock Check (Robust Self-Healing)
   useEffect(() => {
      if (currentUser && currentUser.role === 'STUDENT') {
-         // 1. Onboarding Check
          const hasRefs = currentUser.interiorRefUrl && currentUser.exteriorRefUrl;
          if (!hasRefs) {
              setIsOnboarding(true);
          } else {
              setIsOnboarding(false);
              
-             // 2. Auto-Unlock Logic (Self-Healing for existing users)
+             // Auto-Unlock Logic
              const firstStep = currentUser.classType === 'MASTER_CLASS' ? 'BOX_MODELING' : 'COLOR_RENDERING';
              const currentProgress = currentUser.progress || { INTERIOR: [], EXTERIOR: [] };
              let changed = false;
              
-             // Ensure arrays exist
              const newInterior = [...(currentProgress.INTERIOR || [])];
              const newExterior = [...(currentProgress.EXTERIOR || [])];
 
@@ -257,11 +281,7 @@ function App() {
 
              if (changed) {
                  const newProgress = { INTERIOR: newInterior, EXTERIOR: newExterior };
-                 
-                 // Optimistic Update to reflect immediately
                  setCurrentUser(prev => prev ? ({ ...prev, progress: newProgress }) : null);
-                 
-                 // Silent DB Update
                  supabase.from('profiles').update({ progress: newProgress }).eq('id', currentUser.id).then(({ error }) => {
                      if(error) console.error("Auto-unlock error:", error);
                  });
@@ -270,7 +290,17 @@ function App() {
      }
   }, [currentUser]);
 
-  // --- SUPABASE INITIALIZATION & FETCHING ---
+  // Click outside listener for Context Menu
+  useEffect(() => {
+      const handleClickOutside = () => {
+          setContextMenu(null);
+          setPreviewMenuOpen(false);
+      };
+      window.addEventListener('click', handleClickOutside);
+      return () => window.removeEventListener('click', handleClickOutside);
+  }, []);
+
+  // --- SUPABASE & DATA ---
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
@@ -441,7 +471,7 @@ function App() {
       return stepStatus;
   };
 
-  // UPDATED: Sort by Newest First (b - a)
+  // Sort by Newest First (b - a)
   function getCommunityGroupedAssignments(filteredAssignments: Assignment[]) {
       const grouped: Record<string, Assignment[]> = {};
       filteredAssignments.forEach(a => {
@@ -450,16 +480,16 @@ function App() {
           grouped[key].push(a);
       });
       return Object.values(grouped).map(group => {
-          // Sort versions within group
+          // Sort versions within group NEWEST FIRST
           return group.sort((a,b) => {
             const dA = new Date(a.submissionDate).getTime();
             const dB = new Date(b.submissionDate).getTime();
-            return dA - dB;
+            return dB - dA;
           });
       }).sort((groupA, groupB) => {
           // Sort groups by latest submission date (Newest First)
-          const latestA = groupA[groupA.length - 1];
-          const latestB = groupB[groupB.length - 1];
+          const latestA = groupA[0]; // Index 0 is newest now
+          const latestB = groupB[0];
           return new Date(latestB.submissionDate).getTime() - new Date(latestA.submissionDate).getTime();
       });
   };
@@ -490,6 +520,114 @@ function App() {
     setTeacherSelectedStudentId(null);
   };
 
+  // --- FILE HANDLING ---
+
+  // 1. APPEND NEW FILES
+  const handleAppendFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!e.target.files || e.target.files.length === 0) return;
+    const files: File[] = Array.from(e.target.files);
+    
+    // Create staging items
+    const newItems: StagingItem[] = files.map(file => ({
+        id: Math.random().toString(36).substr(2, 9),
+        type: 'NEW',
+        url: URL.createObjectURL(file),
+        file: file
+    }));
+
+    setStagingItems(prev => {
+        const updated = [...prev, ...newItems];
+        return updated;
+    });
+    
+    // If this is the first item added, ensure we view it
+    if (stagingItems.length === 0) {
+        setPreviewIndex(0);
+    }
+    
+    setSubmitStep('VERIFY');
+    // Clear input value to allow selecting same file again if needed
+    e.target.value = '';
+  };
+
+  // 2. GLOBAL REPLACE HANDLER (State-Based Index Tracking)
+  const handleGlobalReplaceChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+      // Logic: Only proceed if we have a valid index to replace and a file
+      if (replacingIndex !== null && e.target.files && e.target.files[0]) {
+          const file = e.target.files[0];
+          
+          // Generate truly unique ID to force re-render
+          const uniqueId = `replaced-${file.name}-${file.lastModified}-${Date.now()}`;
+          const newUrl = URL.createObjectURL(file);
+
+          const newItem: StagingItem = {
+              id: uniqueId,
+              type: 'NEW',
+              url: newUrl,
+              file: file
+          };
+
+          setStagingItems(currentItems => {
+              const newFiles = [...currentItems];
+              if (replacingIndex >= 0 && replacingIndex < newFiles.length) {
+                  newFiles[replacingIndex] = newItem;
+              }
+              return newFiles;
+          });
+          
+          // Reset index state to prevent accidental overwrites
+          setReplacingIndex(null);
+      }
+      
+      // Reset input so the same file can be selected again if needed
+      e.target.value = '';
+  };
+
+  const handleRemoveStagingItem = (index: number) => {
+      const newItems = [...stagingItems];
+      newItems.splice(index, 1);
+      setStagingItems(newItems);
+      
+      // Adjust preview index if needed
+      if (index <= previewIndex && previewIndex > 0) {
+          setPreviewIndex(prev => prev - 1);
+      }
+      
+      if (newItems.length === 0) {
+          setSubmitStep('UPLOAD_RENDER');
+          setPreviewIndex(0);
+      }
+  };
+
+  // HYDRATION LOGIC: Pre-fill modal with existing assignment data
+  const handleEditAssignment = (assignment: Assignment) => {
+      setIsEditingAssignmentId(assignment.id);
+      
+      // Find Student to get references (might not be current user if Teacher)
+      const student = allUsers.find(u => u.id === assignment.studentId);
+      if (!student) return;
+
+      const project = assignment.referenceImage === student.interiorRefUrl ? 'INTERIOR' : 'EXTERIOR';
+      
+      setSelectedProjectForSubmit(project);
+      setDetectedStep(assignment.category);
+      setSubmissionMessage(assignment.studentMessage);
+      
+      // HYDRATE STAGING ITEMS
+      const existingItem: StagingItem = {
+          id: assignment.id,
+          type: 'EXISTING',
+          url: assignment.renderImage
+      };
+      setStagingItems([existingItem]);
+      setPreviewIndex(0);
+
+      setActiveTab('SUBMIT');
+      setSubmitStep('VERIFY');
+      setViewingGroupParams(null); // Close view modal
+  };
+
+
   const handleFileUpload = async (
     e: React.ChangeEvent<HTMLInputElement>, 
     setter: (val: any) => void, 
@@ -497,10 +635,10 @@ function App() {
     nextStep?: () => void
   ) => {
     if (!e.target.files || e.target.files.length === 0) return;
-
-    // CHANGED: Handle multiple files
+    
+    // NOTE: This generic handler is now only used for Avatars/Refs (immediate upload)
     const newUrls: string[] = [];
-    const files = Array.from(e.target.files);
+    const files: File[] = Array.from(e.target.files);
 
     try {
         for (const file of files) {
@@ -522,9 +660,9 @@ function App() {
         }
 
         if (bucket === 'renders') {
-            setter(newUrls); // Sets array
+            setter(newUrls); 
         } else {
-            setter(newUrls[0]); // Single for avatar/ref
+            setter(newUrls[0]); 
         }
         
         if (nextStep) nextStep();
@@ -538,18 +676,16 @@ function App() {
   const handleSaveProfileRefs = async () => {
     if (!currentUser) return;
     
-    // UPDATED: Logic to Auto-Unlock First Assignment
     const firstStep = currentUser.classType === 'MASTER_CLASS' ? 'BOX_MODELING' : 'COLOR_RENDERING';
     const currentProgress = currentUser.progress || { INTERIOR: [], EXTERIOR: [] };
     
-    // Explicitly add first step if missing
     if (!currentProgress.INTERIOR.includes(firstStep)) currentProgress.INTERIOR.push(firstStep);
     if (!currentProgress.EXTERIOR.includes(firstStep)) currentProgress.EXTERIOR.push(firstStep);
 
     const updates = {
         interior_ref_url: newInteriorRef || currentUser.interiorRefUrl,
         exterior_ref_url: newExteriorRef || currentUser.exteriorRefUrl,
-        progress: currentProgress // Use the updated progress object
+        progress: currentProgress 
     };
 
     try {
@@ -585,7 +721,9 @@ function App() {
   };
 
   const resetForms = () => {
-    setUploadRenders([]);
+    setStagingItems([]);
+    setPreviewIndex(0);
+    
     setSelectedProjectForSubmit(null);
     setDetectedStep(null);
     setSubmissionMessage('');
@@ -594,6 +732,7 @@ function App() {
     setNewExteriorRef(null);
     setSelectedAssignmentId(null);
     setViewingStudentId(null);
+    setIsEditingAssignmentId(null);
   };
 
   const handleProjectSelectForSubmit = (projectType: 'INTERIOR' | 'EXTERIOR') => {
@@ -617,34 +756,82 @@ function App() {
   };
 
   const handleSubmitAssignment = async () => {
-    if (!currentUser || uploadRenders.length === 0 || !detectedStep || !selectedProjectForSubmit) return;
+    if (!currentUser || stagingItems.length === 0 || !detectedStep || !selectedProjectForSubmit) return;
     
-    const refImage = selectedProjectForSubmit === 'INTERIOR' ? currentUser.interiorRefUrl : currentUser.exteriorRefUrl;
+    // Determine Target Student ID (CurrentUser if student, else if editing teacher uses the assignment owner)
+    let targetStudentId = currentUser.id;
+    if (currentUser.role === 'TEACHER' && isEditingAssignmentId) {
+        const original = assignments.find(a => a.id === isEditingAssignmentId);
+        if (original) targetStudentId = original.studentId;
+    }
+    
+    // Get correct ref image for that student
+    const student = allUsers.find(u => u.id === targetStudentId);
+    if (!student) return;
+    const refImage = selectedProjectForSubmit === 'INTERIOR' ? student.interiorRefUrl : student.exteriorRefUrl;
     if (!refImage) return;
 
     try {
-        // CHANGED: Loop through all uploaded renders and create assignments
-        const existing = assignments.filter(a => a.studentId === currentUser.id && a.category === detectedStep && a.referenceImage === refImage);
+        // 1. Process Uploads for NEW items
+        const finalStagedItems = await Promise.all(stagingItems.map(async (item) => {
+            if (item.type === 'EXISTING') return item;
+
+            // Upload New File
+            if (!item.file) return item; // Should not happen
+            const fileExt = item.file.name.split('.').pop();
+            const fileName = `${Math.random()}.${fileExt}`;
+            const filePath = `${targetStudentId}/${fileName}`;
+
+            const { error: uploadError } = await supabase.storage.from('renders').upload(filePath, item.file);
+            if (uploadError) throw uploadError;
+
+            const { data: { publicUrl } } = supabase.storage.from('renders').getPublicUrl(filePath);
+            return { ...item, url: publicUrl };
+        }));
+
+        // 2. Database Operations
+        // Calculate Week
+        const existing = assignments.filter(a => a.studentId === targetStudentId && a.category === detectedStep && a.referenceImage === refImage);
         let currentWeek = existing.length + 1;
 
-        for (const renderUrl of uploadRenders) {
-            const { error } = await supabase.from('assignments').insert({
-                student_id: currentUser.id,
-                student_message: submissionMessage,
-                week: currentWeek,
-                category: detectedStep,
-                reference_image: refImage,
-                render_image: renderUrl,
-                status: 'PENDING',
-                submission_date: new Date().toISOString()
-            });
-
-            if (error) throw error;
-            currentWeek++;
+        for (let i = 0; i < finalStagedItems.length; i++) {
+            const item = finalStagedItems[i];
+            
+            // Logic: If we are editing, the FIRST item in the list matches the Edited Assignment ID (if it was preserved or replaced).
+            // Any SUBSEQUENT items are treated as NEW versions (Appended).
+            
+            if (isEditingAssignmentId && i === 0) {
+                 // UPDATE EXISTING
+                 const { error } = await supabase.from('assignments').update({
+                     render_image: item.url,
+                     student_message: submissionMessage,
+                     status: 'PENDING',
+                     submission_date: new Date().toISOString()
+                 }).eq('id', isEditingAssignmentId);
+                 if(error) throw error;
+            } else {
+                // INSERT NEW
+                const { error } = await supabase.from('assignments').insert({
+                    student_id: targetStudentId,
+                    student_message: submissionMessage,
+                    week: currentWeek,
+                    category: detectedStep,
+                    reference_image: refImage,
+                    render_image: item.url,
+                    status: 'PENDING',
+                    submission_date: new Date().toISOString()
+                });
+                if (error) throw error;
+                currentWeek++;
+            }
         }
 
         await fetchApplicationData(); 
-        setActiveTab('PROFILE');
+        if (currentUser.role === 'TEACHER') {
+             setActiveTab('DASHBOARD');
+        } else {
+             setActiveTab('PROFILE');
+        }
         resetForms();
 
     } catch (err) {
@@ -652,13 +839,62 @@ function App() {
         alert('Failed to submit assignment.');
     }
   };
+  
+  // DELETE LOGIC
+  const handleDeleteAssignment = async (assignment: Assignment) => {
+      const confirmMsg = "Are you sure you want to delete this assignment? This action cannot be undone.";
+      if (!window.confirm(confirmMsg)) return;
 
-  // UPDATED: Handle Auto-Unlock on Approve
+      try {
+          const { error } = await supabase.from('assignments').delete().eq('id', assignment.id);
+          if (error) throw error;
+          
+          // SMOOTHER DELETE: Check if we should close modal or stay
+          const remainingInGroup = assignments.filter(a => 
+            a.studentId === assignment.studentId && 
+            a.category === assignment.category && 
+            a.referenceImage === assignment.referenceImage && 
+            a.id !== assignment.id
+          );
+
+          if (remainingInGroup.length === 0) {
+              setViewingGroupParams(null); // Close modal if no versions left
+          } else {
+              setViewingVersionIndex(0); // Snap to newest available version
+          }
+
+          await fetchApplicationData(); 
+      } catch (err) {
+          console.error("Delete failed:", err);
+          alert("Failed to delete assignment.");
+      }
+  };
+
+  // TEACHER RESET
+  const handleTeacherResetStudent = async (studentId: string) => {
+      if (!window.confirm("WARNING: This will delete ALL assignments and references for this student. They will be reset to a new account state. Continue?")) return;
+      
+      try {
+          // 1. Delete Assignments
+          await supabase.from('assignments').delete().eq('student_id', studentId);
+          // 2. Reset Profile
+          await supabase.from('profiles').update({
+              interior_ref_url: null,
+              exterior_ref_url: null,
+              progress: { INTERIOR: [], EXTERIOR: [] }
+          }).eq('id', studentId);
+          
+          await fetchApplicationData();
+          setContextMenu(null);
+      } catch (err) {
+          console.error("Reset failed:", err);
+      }
+  };
+
   const handleTeacherAction = async (targetAssignmentId: string, action: 'APPROVE' | 'REJECT') => {
     if (!currentUser) return;
 
     try {
-        // 1. Insert Feedback
         const { error: feedbackError } = await supabase.from('feedback').insert({
             assignment_id: targetAssignmentId,
             teacher_id: currentUser.id,
@@ -667,14 +903,12 @@ function App() {
         });
         if (feedbackError) throw feedbackError;
 
-        // 2. Update Assignment Status
         const { error: statusError } = await supabase
             .from('assignments')
             .update({ status: action === 'APPROVE' ? 'APPROVED' : 'REJECTED' })
             .eq('id', targetAssignmentId);
         if (statusError) throw statusError;
 
-        // 3. AUTO UNLOCK LOGIC
         if (action === 'APPROVE') {
             const assignment = assignments.find(a => a.id === targetAssignmentId);
             const student = allUsers.find(u => u.id === assignment?.studentId);
@@ -686,7 +920,6 @@ function App() {
                 const curriculum = CURRICULUM[student.classType];
                 const currentIndex = curriculum.indexOf(assignment.category);
                 
-                // If there is a next step
                 if (currentIndex !== -1 && currentIndex < curriculum.length - 1) {
                     const nextStep = curriculum[currentIndex + 1];
                     const currentProgress = student.progress ? [...student.progress[track]] : [];
@@ -726,7 +959,9 @@ function App() {
           }
           const updatedProgressObj = { ...user.progress, [project]: newProgress };
           await supabase.from('profiles').update({ progress: updatedProgressObj }).eq('id', studentId);
-          setAllUsers(allUsers.map(u => u.id === studentId ? { ...u, progress: updatedProgressObj } : u));
+          
+          // FIX LOCK SYNC: Fetch data immediately to ensure state propagates
+          await fetchApplicationData();
       }
   };
 
@@ -797,7 +1032,7 @@ function App() {
                                             category: stepData.step,
                                             referenceImage: studentProjectView === 'INTERIOR' ? student.interiorRefUrl! : student.exteriorRefUrl!
                                         });
-                                        setViewingVersionIndex(stepData.assignments.length - 1);
+                                        setViewingVersionIndex(0); // Start at newest (index 0)
                                     } else if (isAvailable && isMe) {
                                         setSelectedProjectForSubmit(studentProjectView);
                                         setDetectedStep(stepData.step);
@@ -884,7 +1119,7 @@ function App() {
                                                             category: p.step,
                                                             referenceImage: project === 'INTERIOR' ? student.interiorRefUrl! : student.exteriorRefUrl!
                                                         });
-                                                        setViewingVersionIndex(p.assignments.length - 1);
+                                                        setViewingVersionIndex(0);
                                                         setSelectedAssignmentId(p.latest?.id || null);
                                                     }}
                                                     className="text-[10px] text-[#c7023a] hover:underline font-bold mt-1"
@@ -1225,7 +1460,7 @@ function App() {
   }
 
   return (
-    <div className="min-h-screen bg-[#050505] text-white font-sans selection:bg-[#c7023a] selection:text-white">
+    <div className="min-h-screen bg-[#050505] text-white font-sans selection:bg-[#c7023a] selection:text-white" onClick={() => setContextMenu(null)}>
       {renderSidebar()}
       
       <main className="pl-20 min-h-screen relative">
@@ -1281,7 +1516,7 @@ function App() {
                         
                         return true;
                     })).map((group, idx) => {
-                        const latest = group[group.length - 1];
+                        const latest = group[0]; // Now index 0 is newest
                         const student = allUsers.find(u => u.id === latest.studentId);
                         
                         return (
@@ -1293,9 +1528,21 @@ function App() {
                                         category: latest.category,
                                         referenceImage: latest.referenceImage
                                     });
-                                    setViewingVersionIndex(group.length - 1);
+                                    setViewingVersionIndex(0);
                                 }}
-                                className="bg-zinc-900/40 border border-white/5 rounded-xl overflow-hidden hover:border-white/20 hover:bg-zinc-900/60 transition-all cursor-pointer group flex flex-col shadow-lg"
+                                onContextMenu={(e) => {
+                                    if(currentUser.role === 'TEACHER') {
+                                        e.preventDefault();
+                                        setContextMenu({ 
+                                            x: e.clientX, 
+                                            y: e.clientY, 
+                                            assignmentId: latest.id, 
+                                            category: latest.category, 
+                                            studentId: latest.studentId
+                                        });
+                                    }
+                                }}
+                                className="bg-zinc-900/40 border border-white/5 rounded-xl overflow-hidden hover:border-white/20 hover:bg-zinc-900/60 transition-all cursor-pointer group flex flex-col shadow-lg relative"
                             >
                                 <div className="aspect-[4/3] bg-black relative">
                                     <img src={latest.renderImage} className="w-full h-full object-cover opacity-80 group-hover:opacity-100 transition-opacity duration-500" />
@@ -1330,6 +1577,33 @@ function App() {
                 </div>
               </div>
           )}
+          
+          {/* TEACHER CONTEXT MENU */}
+          {contextMenu && currentUser.role === 'TEACHER' && (
+              <div className="fixed z-[100] bg-zinc-900 border border-zinc-700 shadow-2xl rounded-lg py-1 w-56 animate-fade-in" style={{ top: contextMenu.y, left: contextMenu.x }}>
+                  <div className="px-3 py-2 text-[10px] font-bold text-zinc-500 uppercase tracking-wider border-b border-zinc-800 mb-1">Actions</div>
+                  <button onClick={() => {
+                        const assign = assignments.find(a => a.id === contextMenu.assignmentId);
+                        if(assign) handleDeleteAssignment(assign);
+                        setContextMenu(null);
+                  }} className="w-full text-left px-4 py-2 text-sm text-white hover:bg-zinc-800 flex items-center gap-2">
+                      <Trash2 size={14} /> Delete Assignment
+                  </button>
+                  {/* TEACHER EDIT SHORTCUT */}
+                  <button onClick={() => {
+                      const assign = assignments.find(a => a.id === contextMenu.assignmentId);
+                      if (assign) handleEditAssignment(assign);
+                      setContextMenu(null);
+                  }} className="w-full text-left px-4 py-2 text-sm text-white hover:bg-zinc-800 flex items-center gap-2">
+                      <Edit2 size={14} /> Edit Assignment
+                  </button>
+                  {contextMenu.category === 'BOX_MODELING' && (
+                      <button onClick={() => handleTeacherResetStudent(contextMenu.studentId)} className="w-full text-left px-4 py-2 text-sm text-red-500 hover:bg-red-900/20 flex items-center gap-2 border-t border-zinc-800 mt-1">
+                          <AlertCircle size={14} /> Full Student Reset
+                      </button>
+                  )}
+              </div>
+          )}
 
           {studentViewAssignmentGroup && (
               <div className="fixed inset-0 z-[60] bg-black/80 backdrop-blur-lg flex items-center justify-center p-4 animate-fade-in">
@@ -1338,15 +1612,18 @@ function App() {
                       if (!currentVersion) return null;
 
                       const student = allUsers.find(u => u.id === currentVersion.studentId);
-                      const isLatest = viewingVersionIndex === studentViewAssignmentGroup.length - 1;
+                      const isLatest = viewingVersionIndex === 0;
                       const studentIsOwner = currentUser.id === currentVersion.studentId;
                       const progress = getProjectProgress(currentVersion.studentId, currentVersion.referenceImage === currentUser.interiorRefUrl ? 'INTERIOR' : 'EXTERIOR');
                       const stepInfo = progress.find(p => p.step === currentVersion.category);
                       const isLocked = stepInfo?.status === 'LOCKED';
                       const canSubmitNewVersion = studentIsOwner && isLatest && !isLocked;
+                      const canDelete = currentUser.role === 'TEACHER' || (studentIsOwner && currentVersion.status === 'PENDING');
+                      // Unified Edit Logic
+                      const canEdit = currentUser.role === 'TEACHER' || (studentIsOwner && currentVersion.status === 'PENDING');
 
-                      const hasPrev = currentGroupIdx > 0;
-                      const hasNext = currentGroupIdx < filteredCommunityGroups.length - 1;
+                      const hasPrev = viewingVersionIndex > 0 || currentGroupIdx > 0;
+                      const hasNext = viewingVersionIndex < studentViewAssignmentGroup.length - 1 || currentGroupIdx < filteredCommunityGroups.length - 1;
 
                       return (
                         <div className="w-full h-full max-w-[1800px] bg-[#050505] border border-white/10 rounded-3xl flex flex-col overflow-hidden shadow-2xl relative">
@@ -1366,11 +1643,21 @@ function App() {
                                      <div className="flex items-center gap-3 text-xs text-zinc-500 mt-1">
                                          <span className="font-bold text-[#c7023a] uppercase tracking-wider">Assignment {currentVersion.week.toString().padStart(2, '0')}</span>
                                          <span className="w-1 h-1 rounded-full bg-zinc-700"></span>
-                                         <span>Version {viewingVersionIndex + 1} of {studentViewAssignmentGroup.length}</span>
+                                         <span>Version {studentViewAssignmentGroup.length - viewingVersionIndex} of {studentViewAssignmentGroup.length}</span>
                                      </div>
                                  </div>
-                                 <div className="ml-8">
+                                 <div className="ml-8 flex items-center gap-4">
                                      <StatusBadge status={currentVersion.status} />
+                                     {canEdit && (
+                                         <button onClick={() => handleEditAssignment(currentVersion)} className="p-2 text-zinc-500 hover:text-white bg-zinc-900 rounded-lg border border-zinc-800" title="Edit Submission">
+                                             <Edit2 size={16} />
+                                         </button>
+                                     )}
+                                     {canDelete && (
+                                         <button onClick={() => handleDeleteAssignment(currentVersion)} className="p-2 text-zinc-500 hover:text-red-500 bg-zinc-900 rounded-lg border border-zinc-800 hover:border-red-900" title="Delete Submission">
+                                             <Trash2 size={16} />
+                                         </button>
+                                     )}
                                  </div>
                              </div>
 
@@ -1388,25 +1675,31 @@ function App() {
 
                                         {/* NAVIGATION ARROWS IN MODAL - MOVED INSIDE & MADE SMALLER */}
                                         {hasPrev && (
-                                            <button onClick={() => navigateGroup('prev')} className="absolute left-2 top-1/2 -translate-y-1/2 z-50 p-2 bg-black/40 hover:bg-[#c7023a] text-white rounded-full backdrop-blur border border-white/10 transition-all shadow-lg hover:scale-105 group-hover/image-area:opacity-100 opacity-0 transition-opacity duration-300">
+                                            <button onClick={() => {
+                                                if (viewingVersionIndex > 0) setViewingVersionIndex(prev => prev - 1);
+                                                else navigateGroup('prev');
+                                            }} className="absolute left-2 top-1/2 -translate-y-1/2 z-50 p-2 bg-black/40 hover:bg-[#c7023a] text-white rounded-full backdrop-blur border border-white/10 transition-all shadow-lg hover:scale-105 group-hover/image-area:opacity-100 opacity-0 transition-opacity duration-300">
                                                 <ChevronLeft size={20} />
                                             </button>
                                         )}
                                         {hasNext && (
-                                            <button onClick={() => navigateGroup('next')} className="absolute right-2 top-1/2 -translate-y-1/2 z-50 p-2 bg-black/40 hover:bg-[#c7023a] text-white rounded-full backdrop-blur border border-white/10 transition-all shadow-lg hover:scale-105 group-hover/image-area:opacity-100 opacity-0 transition-opacity duration-300">
+                                            <button onClick={() => {
+                                                if (viewingVersionIndex < studentViewAssignmentGroup.length - 1) setViewingVersionIndex(prev => prev + 1);
+                                                else navigateGroup('next');
+                                            }} className="absolute right-2 top-1/2 -translate-y-1/2 z-50 p-2 bg-black/40 hover:bg-[#c7023a] text-white rounded-full backdrop-blur border border-white/10 transition-all shadow-lg hover:scale-105 group-hover/image-area:opacity-100 opacity-0 transition-opacity duration-300">
                                                 <ChevronRight size={20} />
                                             </button>
                                         )}
                                      </div>
                                      
-                                     {/* MINIMIZED VERSION HISTORY DOTS */}
+                                     {/* MINIMIZED VERSION HISTORY DOTS (Reversed Logic: Newest on Left) */}
                                      <div className="absolute bottom-6 left-1/2 -translate-x-1/2 bg-black/50 backdrop-blur-md border border-white/10 rounded-full px-3 py-2 flex items-center gap-1.5 shadow-xl">
                                          {studentViewAssignmentGroup.map((_, idx) => (
                                              <button 
                                                 key={idx}
                                                 onClick={() => setViewingVersionIndex(idx)}
                                                 className={`w-2 h-2 rounded-full transition-all ${idx === viewingVersionIndex ? 'bg-[#c7023a] scale-125' : 'bg-white/30 hover:bg-white/60'}`}
-                                                title={`View Version ${idx + 1}`}
+                                                title={`View Version ${studentViewAssignmentGroup.length - idx}`}
                                              />
                                          ))}
                                      </div>
@@ -1555,8 +1848,21 @@ function App() {
               </div>
           )}
 
-          {activeTab === 'SUBMIT' && currentUser.role === 'STUDENT' && (
+          {activeTab === 'SUBMIT' && currentUser.role !== 'TEACHER' && (
              <div className="h-[calc(100vh-140px)] flex flex-col">
+                {/* UPLOAD MODAL CLOSE BUTTON */}
+                <button 
+                    onClick={() => {
+                        if(window.confirm("Are you sure you want to discard changes?")) {
+                            resetForms();
+                            setActiveTab('DASHBOARD');
+                        }
+                    }} 
+                    className="absolute top-4 right-8 z-50 p-2 bg-black/50 text-white rounded-full hover:bg-red-500/80 transition-colors"
+                >
+                    <X size={24} />
+                </button>
+
                 {submitStep !== 'VERIFY' && (
                    <div className="flex items-center justify-center mb-10">
                        <StepIndicator step={1} current={submitStep === 'SELECT_PROJECT' ? 1 : 2} label="Select Project" />
@@ -1600,7 +1906,7 @@ function App() {
                        <button onClick={() => setSubmitStep('SELECT_PROJECT')} className="absolute top-10 left-10 text-zinc-500 hover:text-white flex items-center gap-2 text-sm font-bold tracking-wide"><ArrowRight className="rotate-180" size={16}/> BACK</button>
                        <div className="text-center">
                           <h3 className="text-4xl font-black mb-3 tracking-tighter">
-                             Upload {getAssignmentDisplayName(detectedStep)}
+                             {isEditingAssignmentId ? 'Edit' : 'Upload'} {getAssignmentDisplayName(detectedStep)}
                           </h3>
                           <p className="text-zinc-400 text-base">
                              Submitting for <span className="text-[#c7023a] font-bold">{selectedProjectForSubmit}</span> Project
@@ -1613,28 +1919,82 @@ function App() {
                                 <span className="font-bold text-lg text-zinc-300">Click to Browse</span>
                                 <span className="text-xs text-zinc-600 mt-2">Select one or more images</span>
                             </div>
-                            {/* ADDED: Multiple attribute for multi-upload */}
-                            <input type="file" className="hidden" accept="image/*" multiple onChange={(e) => handleFileUpload(e, setUploadRenders, 'renders', () => setSubmitStep('VERIFY'))} />
+                            {/* UPDATED: Uses specific append handler */}
+                            <input type="file" className="hidden" accept="image/*" multiple={!isEditingAssignmentId} onChange={handleAppendFile} />
                        </label>
                     </div>
                   )}
 
-                  {submitStep === 'VERIFY' && uploadRenders.length > 0 && (
+                  {submitStep === 'VERIFY' && stagingItems.length > 0 && (
                     <div className="flex h-full w-full">
-                       <div className="flex-1 bg-black relative">
+                       {/* GLOBAL HIDDEN INPUT FOR REPLACEMENT */}
+                       <input 
+                           type="file" 
+                           hidden 
+                           ref={replaceInputRef} 
+                           onChange={handleGlobalReplaceChange} 
+                           accept="image/*" 
+                       />
+
+                       <div className="flex-1 bg-black relative group/preview-area">
+                          
+                          {/* OVERLAY: PENCIL MENU (TOP-RIGHT BELOW BADGES) */}
+                          <div className="absolute top-24 right-6 z-[60]">
+                              <button 
+                                 onClick={(e) => { e.stopPropagation(); setPreviewMenuOpen(!previewMenuOpen); }}
+                                 className="text-white hover:text-zinc-300 transition-colors drop-shadow-md p-2"
+                                 title="Edit Image"
+                              >
+                                  <Pencil size={20} style={{ filter: 'drop-shadow(0 2px 4px rgba(0,0,0,0.5))' }} />
+                              </button>
+                              
+                              {previewMenuOpen && (
+                                  <div className="absolute right-0 mt-2 w-48 bg-zinc-900 border border-zinc-700 rounded-xl shadow-2xl py-1 animate-fade-in overflow-hidden z-[70]">
+                                      {/* REPLACED WITH STATE-BASED TRIGGER */}
+                                      <button 
+                                          onClick={() => {
+                                              // Track exactly which index we are replacing
+                                              setReplacingIndex(previewIndex);
+                                              // Trigger the hidden input
+                                              replaceInputRef.current?.click();
+                                              setPreviewMenuOpen(false);
+                                          }} 
+                                          className="w-full text-left px-4 py-3 text-sm text-white hover:bg-zinc-800 flex items-center gap-3 cursor-pointer transition-colors"
+                                      >
+                                          <Upload size={14} /> Replace Image
+                                      </button>
+                                      
+                                      <button onClick={() => {
+                                          handleRemoveStagingItem(previewIndex);
+                                          setPreviewMenuOpen(false);
+                                      }} className="w-full text-left px-4 py-3 text-sm text-red-500 hover:bg-red-900/20 flex items-center gap-3 transition-colors border-t border-zinc-800">
+                                          <Trash2 size={14} /> Delete Image
+                                      </button>
+                                  </div>
+                              )}
+                          </div>
+
+                          {/* MAIN PREVIEW */}
                           <ComparisonViewer 
-                            refImage={selectedProjectForSubmit === 'INTERIOR' ? currentUser.interiorRefUrl! : currentUser.exteriorRefUrl!}
-                            renderImage={uploadRenders[uploadRenders.length - 1]} // Show the last uploaded image as preview
+                            key={stagingItems[previewIndex]?.id || `empty-preview`}
+                            refImage={selectedProjectForSubmit === 'INTERIOR' ? currentUser?.interiorRefUrl! : currentUser?.exteriorRefUrl!}
+                            renderImage={stagingItems[previewIndex]?.url || ''}
                             mode={compMode}
                             setMode={setCompMode}
                             fullViewSource={fullViewSource}
                             onFullViewToggle={() => setFullViewSource(prev => prev === 'REF' ? 'RENDER' : 'REF')}
                           />
-                          {uploadRenders.length > 1 && (
-                              <div className="absolute bottom-4 left-4 bg-black/60 px-4 py-2 rounded-lg text-xs font-bold text-white border border-white/10 backdrop-blur">
-                                  + {uploadRenders.length - 1} other files selected
-                              </div>
-                          )}
+
+                          {/* BOTTOM CENTER: PAGINATION DOTS */}
+                          <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-[50] flex items-center gap-2 bg-black/40 backdrop-blur-md px-4 py-2 rounded-full border border-white/10">
+                              {stagingItems.map((_, idx) => (
+                                  <button
+                                      key={idx}
+                                      onClick={() => setPreviewIndex(idx)}
+                                      className={`w-2.5 h-2.5 rounded-full transition-all ${idx === previewIndex ? 'bg-[#c7023a] scale-125' : 'bg-white/30 hover:bg-white/80'}`}
+                                  />
+                              ))}
+                          </div>
                        </div>
 
                        <div className="w-96 bg-[#0a0a0a] border-l border-white/5 flex flex-col p-8 z-10 shadow-2xl">
@@ -1655,17 +2015,138 @@ function App() {
 
                           <div className="mt-auto space-y-4 pt-8 border-t border-white/5">
                               <button onClick={handleSubmitAssignment} className="w-full bg-[#c7023a] hover:bg-red-700 text-white py-4 rounded-xl font-bold shadow-lg shadow-red-900/20 flex items-center justify-center gap-2 transition-all hover:-translate-y-1">
-                                  {isResubmission ? 'Resubmit Fix' : `Submit ${uploadRenders.length} File${uploadRenders.length > 1 ? 's' : ''}`} <ArrowRight size={18} />
+                                  {isEditingAssignmentId ? 'Update Submission' : (isResubmission ? 'Resubmit Fix' : `Submit ${stagingItems.length} File${stagingItems.length > 1 ? 's' : ''}`)} <ArrowRight size={18} />
                               </button>
-                              <button onClick={() => setSubmitStep('UPLOAD_RENDER')} className="w-full py-2 rounded-lg font-bold text-zinc-500 hover:text-white text-xs tracking-wide">
-                                  SELECT DIFFERENT IMAGES
-                              </button>
+                              
+                              {/* ADD NEW VERSION BUTTON - TRIGGERS FILE INPUT VIA LABEL */}
+                              <label 
+                                className="w-full py-4 rounded-xl font-bold border-2 border-dashed border-zinc-700 hover:border-zinc-500 text-zinc-500 hover:text-white flex items-center justify-center gap-2 transition-all cursor-pointer"
+                              >
+                                  <PlusCircle size={18} /> Add New Version
+                                  {/* UPDATED: Uses specific append handler */}
+                                  <input type="file" className="hidden" accept="image/*" multiple onChange={handleAppendFile} />
+                              </label>
                           </div>
                        </div>
                     </div>
                   )}
                 </div>
              </div>
+          )}
+
+          {/* TEACHER SUBMISSION/EDIT MODAL (Reuse Student UI Logic) */}
+          {activeTab === 'SUBMIT' && currentUser.role === 'TEACHER' && (
+               <div className="h-[calc(100vh-140px)] flex flex-col">
+                  {/* Reuse the Verification UI Block exactly as student sees it */}
+                   <button 
+                        onClick={() => {
+                            resetForms();
+                            setActiveTab('DASHBOARD');
+                        }} 
+                        className="absolute top-4 right-8 z-50 p-2 bg-black/50 text-white rounded-full hover:bg-red-500/80 transition-colors"
+                    >
+                        <X size={24} />
+                    </button>
+
+                  <div className="flex-1 flex flex-col bg-zinc-900/30 border border-white/5 rounded-3xl overflow-hidden relative shadow-2xl backdrop-blur-sm">
+                        {/* TEACHER EDIT MODE ALWAYS LANDS ON VERIFY */}
+                        <div className="flex h-full w-full">
+                           <div className="flex-1 bg-black relative group/preview-area">
+                              
+                              {/* OVERLAY: PENCIL MENU (TOP-RIGHT BELOW BADGES) */}
+                              <div className="absolute top-24 right-6 z-[60]">
+                                  <button 
+                                     onClick={(e) => { e.stopPropagation(); setPreviewMenuOpen(!previewMenuOpen); }}
+                                     className="text-white hover:text-zinc-300 transition-colors drop-shadow-md p-2"
+                                     title="Edit Image"
+                                  >
+                                      <Pencil size={20} style={{ filter: 'drop-shadow(0 2px 4px rgba(0,0,0,0.5))' }} />
+                                  </button>
+                                  
+                                  {previewMenuOpen && (
+                                      <div className="absolute right-0 mt-2 w-48 bg-zinc-900 border border-zinc-700 rounded-xl shadow-2xl py-1 animate-fade-in overflow-hidden z-[70]">
+                                          {/* REPLACED WITH STATE-BASED TRIGGER (TEACHER VIEW) */}
+                                          <button 
+                                              onClick={() => {
+                                                  setReplacingIndex(previewIndex);
+                                                  replaceInputRef.current?.click();
+                                                  setPreviewMenuOpen(false);
+                                              }} 
+                                              className="w-full text-left px-4 py-3 text-sm text-white hover:bg-zinc-800 flex items-center gap-3 cursor-pointer transition-colors"
+                                          >
+                                              <Upload size={14} /> Replace Image
+                                          </button>
+                                          
+                                          <button onClick={() => {
+                                              handleRemoveStagingItem(previewIndex);
+                                              setPreviewMenuOpen(false);
+                                          }} className="w-full text-left px-4 py-3 text-sm text-red-500 hover:bg-red-900/20 flex items-center gap-3 transition-colors border-t border-zinc-800">
+                                              <Trash2 size={14} /> Delete Image
+                                          </button>
+                                      </div>
+                                  )}
+                              </div>
+
+                              {/* MAIN PREVIEW */}
+                              {stagingItems.length > 0 && (
+                                  <ComparisonViewer 
+                                    key={stagingItems[previewIndex]?.id || 'empty-preview-teacher'}
+                                    refImage={selectedProjectForSubmit === 'INTERIOR' ? allUsers.find(u => u.id === assignments.find(a => a.id === isEditingAssignmentId)?.studentId)?.interiorRefUrl! : allUsers.find(u => u.id === assignments.find(a => a.id === isEditingAssignmentId)?.studentId)?.exteriorRefUrl!}
+                                    renderImage={stagingItems[previewIndex]?.url || ''}
+                                    mode={compMode}
+                                    setMode={setCompMode}
+                                    fullViewSource={fullViewSource}
+                                    onFullViewToggle={() => setFullViewSource(prev => prev === 'REF' ? 'RENDER' : 'REF')}
+                                  />
+                              )}
+
+                              {/* BOTTOM CENTER: PAGINATION DOTS */}
+                              <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-[50] flex items-center gap-2 bg-black/40 backdrop-blur-md px-4 py-2 rounded-full border border-white/10">
+                                  {stagingItems.map((_, idx) => (
+                                      <button
+                                          key={idx}
+                                          onClick={() => setPreviewIndex(idx)}
+                                          className={`w-2.5 h-2.5 rounded-full transition-all ${idx === previewIndex ? 'bg-[#c7023a] scale-125' : 'bg-white/30 hover:bg-white/80'}`}
+                                      />
+                                  ))}
+                              </div>
+                           </div>
+
+                           <div className="w-96 bg-[#0a0a0a] border-l border-white/5 flex flex-col p-8 z-10 shadow-2xl">
+                              <div className="mb-8">
+                                  <div className="flex items-center gap-2 mb-2">
+                                     <div className="px-2 py-0.5 bg-[#c7023a] text-white text-[10px] font-bold rounded">TEACHER EDIT</div>
+                                  </div>
+                                  <h3 className="font-bold text-white text-xl mb-2 tracking-tight">Edit Submission</h3>
+                                  <p className="text-xs text-zinc-500 leading-relaxed">You are modifying a student's submission directly.</p>
+                              </div>
+                              
+                              <div className="flex-1">
+                                  <label className="block text-[10px] font-bold text-zinc-500 uppercase tracking-widest mb-3">Student Note</label>
+                                  <textarea 
+                                    className="w-full bg-zinc-900/50 border border-zinc-800 rounded-xl p-4 text-sm text-white outline-none focus:border-[#c7023a] resize-none h-40 transition-all placeholder:text-zinc-700"
+                                    value={submissionMessage}
+                                    onChange={e => setSubmissionMessage(e.target.value)}
+                                  />
+                              </div>
+
+                              <div className="mt-auto space-y-4 pt-8 border-t border-white/5">
+                                  <button onClick={handleSubmitAssignment} className="w-full bg-[#c7023a] hover:bg-red-700 text-white py-4 rounded-xl font-bold shadow-lg shadow-red-900/20 flex items-center justify-center gap-2 transition-all hover:-translate-y-1">
+                                      Update Submission <ArrowRight size={18} />
+                                  </button>
+                                  
+                                  <label 
+                                    className="w-full py-4 rounded-xl font-bold border-2 border-dashed border-zinc-700 hover:border-zinc-500 text-zinc-500 hover:text-white flex items-center justify-center gap-2 transition-all cursor-pointer"
+                                  >
+                                      <PlusCircle size={18} /> Add New Version
+                                      {/* UPDATED: Uses specific append handler */}
+                                      <input type="file" className="hidden" accept="image/*" multiple onChange={handleAppendFile} />
+                                  </label>
+                              </div>
+                           </div>
+                        </div>
+                  </div>
+               </div>
           )}
 
           {currentUser.role === 'TEACHER' && activeTab === 'DASHBOARD' && (
